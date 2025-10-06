@@ -123,19 +123,25 @@ def downsample_video(
     resolution=240
 ):
     ratio = f"{int(resolution*16/9)}:{resolution}"
-    cmd = [get_ffmpeg_bin()]
-    cmd += ["-hwaccel", "cuvid"]
-    cmd += ["-hwaccel_output_format", "cuda"]
-    cmd += ["-i", shlex.quote(input_video)]
-    cmd += ["-vcodec", "h264_nvenc"]
-    cmd += ["-vf", f'scale_cuda="{ratio}"']
-    cmd += ["-cq", "26"]
-    cmd += [shlex.quote(output_video)]
+    def run_cmd(parts):
+        cmd_line = " ".join(parts)
+        print("Complete command:")
+        print(cmd_line)
+        return subprocess.run(cmd_line, shell=True)
 
-    cmd = " ".join(cmd)
-    print("Complete command:")
-    print(cmd)
-    result = subprocess.run(cmd, shell=True)
+    # Try GPU scale with CUDA
+    cmd = [get_ffmpeg_bin(), "-hwaccel", "cuvid", "-hwaccel_output_format", "cuda",
+           "-i", shlex.quote(input_video), "-vcodec", "h264_nvenc",
+           "-vf", f'scale_cuda="{ratio}"', "-cq", "26", shlex.quote(output_video)]
+    result = run_cmd(cmd)
+
+    if result.returncode != 0 or not os.path.exists(output_video):
+        # Fallback: software scale, NVENC encode
+        print("GPU scale failed or output missing; falling back to software scale.")
+        cmd2 = [get_ffmpeg_bin(), "-i", shlex.quote(input_video),
+                "-vf", f'scale={ratio}', "-c:v", "h264_nvenc", "-cq", "26",
+                shlex.quote(output_video)]
+        result = run_cmd(cmd2)
 
 
 def handler(job_main):
