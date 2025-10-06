@@ -2,6 +2,7 @@
 - GPU-enabled FFmpeg template for RunPod (CUDA 12.x)
 - Supports inputs from `http(s)://`, `gs://`, and `s3://`
 - Outputs to `gs://` or `s3://` buckets
+  - Works with Cloudflare R2 via S3 API
 
 ## Deploy to RunPod Serverless
 - Build image: `docker build -t <registry>/<repo>:<tag> .`
@@ -10,8 +11,22 @@
 - Command is set via Dockerfile (`python3.11 -u /handler.py`).
 - Set environment variables as needed:
   - `S3_ENDPOINT_URL` (default: `https://storage.googleapis.com`)
-  - `S3_REGION` (default: `auto` for GCS; e.g. `us-east-1` for AWS)
-  - `HMAC_KEY`/`HMAC_SECRET` (GCS HMAC) or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (AWS S3)
+  - `S3_REGION` (default: `auto`)
+  - `S3_ADDRESSING_STYLE` (default: `virtual`; set `path` if needed)
+  - `HMAC_KEY`/`HMAC_SECRET` (GCS HMAC) or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (AWS S3, Cloudflare R2)
+
+### Cloudflare R2 Setup
+- Create/Get an R2 bucket (e.g., `uploaded-audio`).
+- Create R2 S3 API credentials: R2 > Settings > S3 API Tokens > Create API Token (Object Read/Write).
+- Collect:
+  - `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+  - Your account ID (from R2; used in endpoint URL)
+- Set in RunPod Template env vars:
+  - `S3_ENDPOINT_URL` = `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
+  - `S3_REGION` = `auto`
+  - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` = from token
+  - Optional: `S3_ADDRESSING_STYLE` = `virtual` (default) or `path`
+- Use `s3://<bucket>/<key>` URIs for outputs, e.g. `s3://uploaded-audio/exports/out.mp4`.
 
 ## Invocation Payloads
 
@@ -58,7 +73,7 @@ Downsampling (input can be public URL):
     "task": "DOWNSAMPLING",
     "parameters": {
       "original_video_uri": "https://example.com/big.mp4",
-      "output_video_uri": "gs://my-bucket/exports/downsampled.mp4",
+      "output_video_uri": "s3://uploaded-audio/exports/downsampled.mp4",  // R2 example
       "resolution": "360p"  // or 240, 360, 480 etc.
     }
   }

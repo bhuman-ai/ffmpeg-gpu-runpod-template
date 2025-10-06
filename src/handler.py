@@ -8,11 +8,13 @@ import tempfile
 import subprocess
 from urllib.parse import urlparse
 import requests
+from botocore.config import Config as BotoConfig
 
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "https://storage.googleapis.com")
 S3_REGION = os.environ.get("S3_REGION", "auto")
 S3_ACCESS_KEY = os.environ.get("HMAC_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.environ.get("HMAC_SECRET") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+S3_ADDRESSING_STYLE = os.environ.get("S3_ADDRESSING_STYLE", "virtual")  # "virtual" or "path"
 
 s3 = boto3.client(
     "s3",
@@ -20,6 +22,10 @@ s3 = boto3.client(
     endpoint_url=S3_ENDPOINT_URL,
     aws_access_key_id=S3_ACCESS_KEY,
     aws_secret_access_key=S3_SECRET_KEY,
+    config=BotoConfig(
+        signature_version="s3v4",
+        s3={"addressing_style": S3_ADDRESSING_STYLE},
+    ),
 )
 
 
