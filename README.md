@@ -3,6 +3,7 @@
 - Supports inputs from `http(s)://`, `gs://`, and `s3://`
 - Outputs to `gs://` or `s3://` buckets
   - Works with Cloudflare R2 via S3 API
+  - Or upload via HTTPS presigned PUT (`output_put_url`)
 
 ## Deploy to RunPod Serverless
 - Build image: `docker build -t <registry>/<repo>:<tag> .`
@@ -27,6 +28,30 @@
   - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` = from token
   - Optional: `S3_ADDRESSING_STYLE` = `virtual` (default) or `path`
 - Use `s3://<bucket>/<key>` URIs for outputs, e.g. `s3://uploaded-audio/exports/out.mp4`.
+
+### Alternative: Presigned URL Upload (no credentials in worker)
+- Generate a presigned PUT URL for the target object (valid for e.g. 1 hour).
+- Then pass it in the payload as `output_put_url` instead of `output_video_uri`.
+
+Using AWS CLI against R2 (macOS/Linux):
+```
+aws configure set default.s3.signature_version s3v4
+aws --endpoint-url https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+    s3 presign s3://uploaded-audio/exports/out.mp4 --expires-in 3600
+```
+The command prints a long `https://...` URL. Use it like:
+```
+{
+  "input": {
+    "task": "DOWNSAMPLING",
+    "parameters": {
+      "original_video_uri": "https://example.com/video.mp4",
+      "output_put_url": "https://<presigned-url>",
+      "resolution": "360p"
+    }
+  }
+}
+```
 
 ## Invocation Payloads
 

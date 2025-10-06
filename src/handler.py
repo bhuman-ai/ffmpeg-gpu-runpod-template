@@ -58,6 +58,18 @@ def download_uri_to_file(uri: str, filename: str):
     s3.download_file(Bucket=bucket, Key=key, Filename=filename)
 
 
+def upload_file_to_destination(dest: str, filename: str, content_type: str = "video/mp4"):
+    """Upload to s3:// or gs:// via boto3, or to http(s):// via PUT (presigned URL)."""
+    if is_http_uri(dest):
+        with open(filename, "rb") as f:
+            resp = requests.put(dest, data=f, headers={"Content-Type": content_type}, timeout=120)
+        if resp.status_code >= 300:
+            raise Exception(f"HTTP PUT upload failed: {resp.status_code} {resp.text[:512]}")
+        return
+    bucket, key, _ = get_bucket_key(dest)
+    s3.upload_file(Filename=filename, Bucket=bucket, Key=key)
+
+
 def get_ffmpeg_bin():
     candidate = os.environ.get("FFMPEG_BIN")
     if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -235,9 +247,12 @@ def handler(job_main):
                 raise Exception("Video was unable to encode.")
 
             # Upload the resultant video
-            if output_video_uri:
-                bkt, out_key, _ = get_bucket_key(output_video_uri)
-                s3.upload_file(Filename=output_video, Bucket=bkt, Key=out_key)
+            output_put_url = event.get("output_put_url")  # optional: presigned HTTPS PUT
+            if output_put_url:
+                upload_file_to_destination(output_put_url, output_video)
+                uploaded_to = output_put_url
+            elif output_video_uri:
+                upload_file_to_destination(output_video_uri, output_video)
                 uploaded_to = output_video_uri
             else:
                 assert bucket is not None and bucket_parent_folder is not None, "Provide output_video_uri or bucket/bucket_parent_folder"
@@ -273,9 +288,13 @@ def handler(job_main):
             if not os.path.exists(output_video):
                 raise Exception("Video was unable to encode.")
 
-            # Upload the resultant video to the destination S3 bucket
-            bucket, exported_video_key, _ = get_bucket_key(output_video_uri)
-            s3.upload_file(Filename=output_video, Bucket=bucket, Key=exported_video_key)
+            # Upload the resultant video to the destination
+            output_put_url = event.get("output_put_url")  # optional: presigned HTTPS PUT
+            if output_put_url:
+                upload_file_to_destination(output_put_url, output_video)
+            else:
+                bucket, exported_video_key, _ = get_bucket_key(output_video_uri)
+                s3.upload_file(Filename=output_video, Bucket=bucket, Key=exported_video_key)
             return {
                 'statusCode': 200,
                 'body': 'Video downsampling successful!'
