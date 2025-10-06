@@ -183,6 +183,66 @@ def downsample_video(
             result = run_cmd(cmd3)
 
 
+def concatenate_videos(
+    segment_files,
+    output_video: str,
+    crf: int = 23,
+    audio_kbps: int = 128,
+):
+    n = len(segment_files)
+    assert n >= 2, "Need at least 2 segments to concatenate"
+
+    def run_cmd(parts):
+        cmd_line = " ".join(parts)
+        print("Complete command:")
+        print(cmd_line)
+        proc = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+        print(f"Return code: {proc.returncode}")
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        return proc
+
+    # Build inputs
+    base = [get_ffmpeg_bin(), "-y"]
+    for f in segment_files:
+        base += ["-i", shlex.quote(f)]
+
+    # Build filter_complex to normalize streams and concat
+    chains = []
+    for i in range(n):
+        chains.append(f"[{i}:v]scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS-STARTPTS[v{i}]")
+        chains.append(f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=async=0:first_pts=0,asetpts=PTS-STARTPTS[a{i}]")
+    concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n)])
+    filter_complex = f"{';'.join(chains)};{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+
+    # Try 1: NVENC encode
+    cmd1 = base + [
+        "-filter_complex", shlex.quote(filter_complex),
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "h264_nvenc", "-cq", "24",
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        "-movflags", "+faststart",
+        shlex.quote(output_video)
+    ]
+    res = run_cmd(cmd1)
+    if res.returncode == 0 and os.path.exists(output_video):
+        return
+
+    # Try 2: libx264
+    print("NVENC failed; falling back to libx264 for concat.")
+    cmd2 = base + [
+        "-filter_complex", shlex.quote(filter_complex),
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", str(crf),
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        "-movflags", "+faststart",
+        shlex.quote(output_video)
+    ]
+    res = run_cmd(cmd2)
+
+
 def handler(job_main):
     """ Handler function that will be used to process jobs. """
     job = job_main["input"]
@@ -298,6 +358,37 @@ def handler(job_main):
             return {
                 'statusCode': 200,
                 'body': 'Video downsampling successful!'
+            }
+    elif task == "CONCATENATION":
+        segment_urls = event.get("segment_urls") or []
+        output_video_uri = event.get("output_video_uri")
+        output_put_url = event.get("output_put_url")
+        crf = int(event.get("crf", 23))
+        audio_kbps = int(event.get("audio_kbps", 128))
+
+        if not isinstance(segment_urls, list) or len(segment_urls) < 2:
+            raise Exception("Provide segment_urls with at least 2 items")
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            local_segments = []
+            for idx, uri in enumerate(segment_urls):
+                p = os.path.join(tmpdirname, f"seg_{idx}.mp4")
+                print(f"Downloading segment {idx}: {uri}")
+                download_uri_to_file(uri, p)
+                local_segments.append(p)
+
+            output_video = os.path.join(tmpdirname, "concatenated.mp4")
+            concatenate_videos(local_segments, output_video, crf=crf, audio_kbps=audio_kbps)
+            if not os.path.exists(output_video):
+                raise Exception("Concatenation failed.")
+
+            dest = output_put_url or output_video_uri
+            if not dest:
+                raise Exception("Provide output_video_uri or output_put_url")
+            upload_file_to_destination(dest, output_video)
+            return {
+                'statusCode': 200,
+                'body': 'Video concatenation successful!'
             }
     
 
