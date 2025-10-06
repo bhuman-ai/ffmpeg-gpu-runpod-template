@@ -58,6 +58,15 @@ def download_uri_to_file(uri: str, filename: str):
     s3.download_file(Bucket=bucket, Key=key, Filename=filename)
 
 
+def get_ffmpeg_bin():
+    candidate = os.environ.get("FFMPEG_BIN")
+    if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    if os.path.isfile("/ffmpeg") and os.access("/ffmpeg", os.X_OK):
+        return "/ffmpeg"
+    return "ffmpeg"
+
+
 def encode_video(
     input_video: str,
     input_audio: str,
@@ -66,7 +75,7 @@ def encode_video(
     subtitles_enabled: bool = True,
     matroska: bool = False,
 ):
-    cmd = ["/ffmpeg"]
+    cmd = [get_ffmpeg_bin()]
 
     if not subtitles_enabled:
         cmd += ["-hwaccel", "nvdec"]
@@ -114,7 +123,7 @@ def downsample_video(
     resolution=240
 ):
     ratio = f"{int(resolution*16/9)}:{resolution}"
-    cmd = ["/ffmpeg"]
+    cmd = [get_ffmpeg_bin()]
     cmd += ["-hwaccel", "cuvid"]
     cmd += ["-hwaccel_output_format", "cuda"]
     cmd += ["-i", shlex.quote(input_video)]

@@ -19,7 +19,8 @@ RUN python3.11 -m pip install --upgrade pip && \
     python3.11 -m pip install --upgrade -r /requirements.txt --no-cache-dir && \
     rm /requirements.txt
 
-COPY bin/ffmpeg /ffmpeg
+# Optional: install ffmpeg from distro as fallback (NVENC typically enabled on many distros)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 ADD bin/assets /assets
 
 # NOTE: The base image comes with multiple Python versions pre-installed.
