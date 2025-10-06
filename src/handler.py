@@ -1,6 +1,7 @@
 """ Example handler file. """
 
 import os
+import math
 import boto3
 import shlex
 import runpod
@@ -10,7 +11,7 @@ from urllib.parse import urlparse
 import requests
 from botocore.config import Config as BotoConfig
 
-HANDLER_VERSION = "2025-10-06-raw-ffmpeg-v1"
+HANDLER_VERSION = "2025-10-06-raw-ffmpeg-v2"
 
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "https://storage.googleapis.com")
 S3_REGION = os.environ.get("S3_REGION", "auto")
@@ -100,6 +101,32 @@ def run_ffmpeg(parts):
         raise
 
 
+def probe_duration_seconds(path: str) -> float:
+    """Return media duration in seconds using ffprobe; 0.0 if unknown."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return max(0.0, float(proc.stdout.strip()))
+    except Exception as e:
+        print(f"ffprobe error for {path}: {e}")
+    return 0.0
+
+
 def encode_video(
     input_video: str,
     input_audio: str,
@@ -137,7 +164,13 @@ def encode_video(
 
     result = run(gpu_cmd)
     if result.returncode == 0 and os.path.exists(output_video):
-        return
+        try:
+            if os.path.getsize(output_video) > 0:
+                return
+            else:
+                print("encode_video: GPU path produced 0-byte file, will retry")
+        except Exception:
+            pass
 
     # Try 2: CPU filters + NVENC encode
     print("GPU pipeline failed; retrying with software filters + NVENC.")
@@ -149,7 +182,13 @@ def encode_video(
     sw_cmd += ["-map", "0:v", "-map", "1:a", "-c:v", "h264_nvenc", "-c:a", "aac", shlex.quote(output_video)]
     result = run(sw_cmd)
     if result.returncode == 0 and os.path.exists(output_video):
-        return
+        try:
+            if os.path.getsize(output_video) > 0:
+                return
+            else:
+                print("encode_video: SW+NVENC produced 0-byte file, will retry")
+        except Exception:
+            pass
 
     # Try 3: CPU encode with libx264
     print("NVENC not available or failed; retrying with libx264.")
@@ -162,6 +201,13 @@ def encode_video(
     result = run(cpu_cmd)
     if result.returncode != 0:
         print("All encoding strategies failed.")
+    else:
+        try:
+            if not os.path.exists(output_video) or os.path.getsize(output_video) == 0:
+                raise Exception("encode_video: CPU output missing or 0 bytes")
+        except Exception as e:
+            print(str(e))
+            raise
 
 
 def downsample_video(
@@ -249,7 +295,13 @@ def concatenate_videos(
     ]
     res = run_cmd(cmd1)
     if res.returncode == 0 and os.path.exists(output_video):
-        return
+        try:
+            if os.path.getsize(output_video) > 0:
+                return
+            else:
+                print("concatenate_videos: NVENC produced 0-byte output, try libx264")
+        except Exception:
+            pass
 
     # Try 2: libx264
     print("NVENC failed; falling back to libx264 for concat.")
@@ -262,6 +314,13 @@ def concatenate_videos(
         shlex.quote(output_video)
     ]
     res = run_cmd(cmd2)
+    if res.returncode == 0 and os.path.exists(output_video):
+        try:
+            if os.path.getsize(output_video) > 0:
+                return
+        except Exception:
+            pass
+    raise Exception("Concatenation failed or produced empty output.")
 
 
 def handler(job_main):
@@ -432,6 +491,12 @@ def handler(job_main):
 
             if not os.path.exists(out_path):
                 raise Exception("Output file not found after ffmpeg execution.")
+            try:
+                sz = os.path.getsize(out_path)
+            except Exception:
+                sz = 0
+            if sz <= 0:
+                raise Exception("FFMPEG_RAW produced 0-byte output.")
 
             dest = output_put_url or output_video_uri
             if not dest:
@@ -446,6 +511,9 @@ def handler(job_main):
         source_uri = event.get("source_uri")
         start_sec = float(event.get("start_sec", 0))
         duration_sec = float(event.get("duration_sec", 0))
+        # Optional: pad tail to exact integer seconds to satisfy strict croppers (e.g., AudioCrop)
+        target_sec = event.get("target_sec")
+        target_sec = float(target_sec) if target_sec is not None else None
         output_video_uri = event.get("output_video_uri")
         output_put_url = event.get("output_put_url")
         if not source_uri:
@@ -453,23 +521,58 @@ def handler(job_main):
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             src = os.path.join(tmpdirname, "in.m4a")
-            out = os.path.join(tmpdirname, "out.m4a")
+            out = os.path.join(tmpdirname, "out.wav")
             download_uri_to_file(source_uri, src)
 
+            # Build trimming + padding command.
+            # Always attempt to pad output to the next whole second unless an explicit target_sec is provided.
             args = [get_ffmpeg_bin(), "-y"]
+            # Input seek/trim to reduce decode work
             if start_sec > 0:
                 args += ["-ss", str(start_sec)]
             if duration_sec > 0:
                 args += ["-t", str(duration_sec)]
-            args += ["-i", src, "-vn", "-acodec", "aac", "-b:a", "192k", out]
+            args += ["-i", src]
+
+            # Decide final output duration target
+            pad_target = None
+            if target_sec and target_sec > 0:
+                pad_target = int(math.ceil(target_sec))
+            else:
+                # If duration_sec provided, round it up; otherwise base on source duration - start
+                if duration_sec > 0:
+                    desired = max(0.0, float(duration_sec))
+                else:
+                    src_len = probe_duration_seconds(src)
+                    desired = max(0.0, src_len - max(0.0, start_sec))
+                # Tolerate tiny floating errors close to an integer (e.g., 6.00001)
+                frac, whole = math.modf(desired)
+                if frac < 1e-3:
+                    pad_target = int(whole)
+                else:
+                    pad_target = int(math.ceil(desired))
+                if pad_target <= 0:
+                    pad_target = 1
+
+            # Add a small safety margin to avoid decoder/codec priming truncation (esp. with AAC); keep WAV to be exact.
+            pad_target_plus = pad_target + 0.25
+            # Apply padding via filter and cut exactly to target using atrim
+            args += ["-af", f"apad,atrim=0:{pad_target_plus:.2f}"]
+            # Encode to WAV (exact sample count, no encoder delay). Force stereo 48k for downstream consistency.
+            args += ["-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", out]
             proc = run_ffmpeg(args)
             if proc.returncode != 0 or not os.path.exists(out):
                 raise Exception("Audio trim failed")
+            try:
+                if os.path.getsize(out) <= 0:
+                    raise Exception("Audio trim produced 0-byte file")
+            except Exception as e:
+                raise
 
             dest = output_put_url or output_video_uri
             if not dest:
                 raise Exception("Provide output_video_uri or output_put_url")
-            upload_file_to_destination(dest, out, content_type="audio/mp4")
+            upload_file_to_destination(dest, out, content_type="audio/wav")
 
             return { 'statusCode': 200, 'body': 'Audio trim successful!' }
     elif task == "PING":
@@ -504,6 +607,11 @@ def handler(job_main):
             concatenate_videos(local_segments, output_video, crf=crf, audio_kbps=audio_kbps)
             if not os.path.exists(output_video):
                 raise Exception("Concatenation failed.")
+            try:
+                if os.path.getsize(output_video) <= 0:
+                    raise Exception("Concatenation produced 0-byte output")
+            except Exception as e:
+                raise
 
             dest = output_put_url or output_video_uri
             if not dest:
