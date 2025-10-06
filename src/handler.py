@@ -75,46 +75,54 @@ def encode_video(
     subtitles_enabled: bool = True,
     matroska: bool = False,
 ):
-    cmd = [get_ffmpeg_bin()]
+    def run(parts):
+        cmd = " ".join(parts)
+        print("Complete command:")
+        print(cmd)
+        return subprocess.run(cmd, shell=True)
 
-    if not subtitles_enabled:
-        cmd += ["-hwaccel", "nvdec"]
-    
-    cmd += ["-hwaccel_output_format", "cuda"]
-    cmd += ["-i", shlex.quote(input_video)]
-    cmd += ["-i", shlex.quote(input_audio)]
-    fc = []
-
+    # Try 1: Full GPU path (NVDEC + CUDA + NVENC)
+    vf_filters = []
     if subtitles_enabled:
-        cmd += ["-vf"]
-        cmd += [
-            f'ass={subtitles}:fontsdir=/assets,hwupload_cuda'
-        ]
-    
+        vf_filters.append(f"ass={subtitles}:fontsdir=/assets")
+        vf_filters.append("hwupload_cuda")
+
+    gpu_cmd = [get_ffmpeg_bin()]
+    gpu_cmd += ["-hwaccel", "nvdec", "-hwaccel_output_format", "cuda"]
+    gpu_cmd += ["-i", shlex.quote(input_video), "-i", shlex.quote(input_audio)]
+    if vf_filters:
+        gpu_cmd += ["-vf", ",".join(vf_filters)]
     if matroska:
-        cmd += ["-f", "matroska"]
+        gpu_cmd += ["-f", "matroska"]
+    gpu_cmd += ["-map", "0:v", "-map", "1:a", "-c:v", "h264_nvenc", "-c:a", "aac", shlex.quote(output_video)]
 
-    cmd += ["-map", "0:v"]
-    cmd += ["-map", "1:a"]
-    cmd += ["-c:v", "h264_nvenc"]
-    cmd += ["-c:a", "aac"]
-    cmd += [shlex.quote(output_video)]
+    result = run(gpu_cmd)
+    if result.returncode == 0 and os.path.exists(output_video):
+        return
 
-    cmd = " ".join(cmd)
-    print("Complete command:")
-    print(cmd)
-    result = subprocess.run(cmd, shell=True)
+    # Try 2: CPU filters + NVENC encode
+    print("GPU pipeline failed; retrying with software filters + NVENC.")
+    sw_cmd = [get_ffmpeg_bin(), "-i", shlex.quote(input_video), "-i", shlex.quote(input_audio)]
+    if subtitles_enabled:
+        sw_cmd += ["-vf", f"ass={subtitles}:fontsdir=/assets"]
+    if matroska:
+        sw_cmd += ["-f", "matroska"]
+    sw_cmd += ["-map", "0:v", "-map", "1:a", "-c:v", "h264_nvenc", "-c:a", "aac", shlex.quote(output_video)]
+    result = run(sw_cmd)
+    if result.returncode == 0 and os.path.exists(output_video):
+        return
 
-    if result.returncode == 1 and matroska == False:
-        subprocess.run(f"rm {shlex.quote(output_video)};", shell=True)
-        encode_video(
-            input_video,
-            input_audio,
-            subtitles,
-            output_video,
-            subtitles_enabled,
-            matroska=True,
-        )
+    # Try 3: CPU encode with libx264
+    print("NVENC not available or failed; retrying with libx264.")
+    cpu_cmd = [get_ffmpeg_bin(), "-i", shlex.quote(input_video), "-i", shlex.quote(input_audio)]
+    if subtitles_enabled:
+        cpu_cmd += ["-vf", f"ass={subtitles}:fontsdir=/assets"]
+    if matroska:
+        cpu_cmd += ["-f", "matroska"]
+    cpu_cmd += ["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-c:a", "aac", shlex.quote(output_video)]
+    result = run(cpu_cmd)
+    if result.returncode != 0:
+        print("All encoding strategies failed.")
 
 
 def downsample_video(
@@ -129,19 +137,26 @@ def downsample_video(
         print(cmd_line)
         return subprocess.run(cmd_line, shell=True)
 
-    # Try GPU scale with CUDA
+    # Try 1: GPU scale + NVENC
     cmd = [get_ffmpeg_bin(), "-hwaccel", "cuvid", "-hwaccel_output_format", "cuda",
            "-i", shlex.quote(input_video), "-vcodec", "h264_nvenc",
            "-vf", f'scale_cuda="{ratio}"', "-cq", "26", shlex.quote(output_video)]
     result = run_cmd(cmd)
 
     if result.returncode != 0 or not os.path.exists(output_video):
-        # Fallback: software scale, NVENC encode
+        # Try 2: software scale + NVENC encode
         print("GPU scale failed or output missing; falling back to software scale.")
         cmd2 = [get_ffmpeg_bin(), "-i", shlex.quote(input_video),
                 "-vf", f'scale={ratio}', "-c:v", "h264_nvenc", "-cq", "26",
                 shlex.quote(output_video)]
         result = run_cmd(cmd2)
+        if result.returncode != 0 or not os.path.exists(output_video):
+            # Try 3: software scale + libx264
+            print("NVENC encode failed; falling back to libx264.")
+            cmd3 = [get_ffmpeg_bin(), "-i", shlex.quote(input_video),
+                    "-vf", f'scale={ratio}', "-c:v", "libx264", "-crf", "23",
+                    shlex.quote(output_video)]
+            result = run_cmd(cmd3)
 
 
 def handler(job_main):
