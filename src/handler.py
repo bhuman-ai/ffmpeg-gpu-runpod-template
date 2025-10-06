@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 import requests
 from botocore.config import Config as BotoConfig
 
+HANDLER_VERSION = "2025-10-06-raw-ffmpeg-v1"
+
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "https://storage.googleapis.com")
 S3_REGION = os.environ.get("S3_REGION", "auto")
 S3_ACCESS_KEY = os.environ.get("HMAC_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
@@ -77,6 +79,25 @@ def get_ffmpeg_bin():
     if os.path.isfile("/ffmpeg") and os.access("/ffmpeg", os.X_OK):
         return "/ffmpeg"
     return "ffmpeg"
+
+
+def run_ffmpeg(parts):
+    try:
+        proc = subprocess.run(parts, shell=False, capture_output=True, text=True)
+        print("Complete command:")
+        try:
+            print(" ".join(shlex.quote(p) for p in parts))
+        except Exception:
+            pass
+        print(f"Return code: {proc.returncode}")
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        return proc
+    except Exception as e:
+        print(f"ffmpeg execution error: {e}")
+        raise
 
 
 def encode_video(
@@ -359,6 +380,78 @@ def handler(job_main):
                 'statusCode': 200,
                 'body': 'Video downsampling successful!'
             }
+    elif task == "FFMPEG_RAW":
+        # Execute an arbitrary ffmpeg command with placeholder-substituted inputs/outputs.
+        # parameters: { inputs: [{uri: "..."}, ...], args: ["-i", "{in0}", "...", "{out0}"],
+        #              output_video_uri?: s3://..., output_put_url?: https://... }
+        params = event
+        args = params.get("args", [])
+        inputs = params.get("inputs", [])
+        output_video_uri = params.get("output_video_uri")
+        output_put_url = params.get("output_put_url")
+
+        if not isinstance(args, list) or not args:
+            raise Exception("Provide 'args' array for ffmpeg.")
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            # Download inputs
+            in_map = {}
+            for idx, inp in enumerate(inputs or []):
+                uri = inp.get("uri") if isinstance(inp, dict) else None
+                if not uri:
+                    raise Exception(f"inputs[{idx}].uri missing")
+                local = os.path.join(tmpdirname, f"in{idx}.bin")
+                print(f"Downloading input {idx}: {uri}")
+                download_uri_to_file(uri, local)
+                in_map[f"{{in{idx}}}"] = local
+
+            # Prepare output placeholder(s) — support {out0} only for now
+            out_path = os.path.join(tmpdirname, "out0.mp4")
+            out_map = {"{out0}": out_path}
+
+            # Substitute placeholders
+            resolved_args = []
+            for a in args:
+                if not isinstance(a, str):
+                    a = str(a)
+                # Replace input placeholders
+                for ph, path in in_map.items():
+                    a = a.replace(ph, path)
+                # Replace output placeholders
+                for ph, path in out_map.items():
+                    a = a.replace(ph, path)
+                resolved_args.append(a)
+
+            # Ensure there are no unresolved placeholders remaining
+            leftover = [a for a in resolved_args if "{in" in a or "{out" in a]
+            if leftover:
+                raise Exception(f"Unresolved placeholders in args: {leftover}")
+
+            cmd = [get_ffmpeg_bin()] + resolved_args
+            proc = run_ffmpeg(cmd)
+
+            if not os.path.exists(out_path):
+                raise Exception("Output file not found after ffmpeg execution.")
+
+            dest = output_put_url or output_video_uri
+            if not dest:
+                raise Exception("Provide output_video_uri or output_put_url for upload.")
+            upload_file_to_destination(dest, out_path)
+
+            return {
+                'statusCode': 200,
+                'body': 'FFMPEG command executed successfully!'
+            }
+    elif task == "PING":
+        return {
+            'statusCode': 200,
+            'version': HANDLER_VERSION,
+            'env': {
+                'S3_ENDPOINT_URL': S3_ENDPOINT_URL,
+                'S3_REGION': S3_REGION,
+            },
+            'body': 'pong'
+        }
     elif task == "CONCATENATION":
         segment_urls = event.get("segment_urls") or []
         output_video_uri = event.get("output_video_uri")
