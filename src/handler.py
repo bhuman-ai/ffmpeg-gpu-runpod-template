@@ -442,6 +442,36 @@ def handler(job_main):
                 'statusCode': 200,
                 'body': 'FFMPEG command executed successfully!'
             }
+    elif task == "AUDIO_TRIM":
+        source_uri = event.get("source_uri")
+        start_sec = float(event.get("start_sec", 0))
+        duration_sec = float(event.get("duration_sec", 0))
+        output_video_uri = event.get("output_video_uri")
+        output_put_url = event.get("output_put_url")
+        if not source_uri:
+            raise Exception("source_uri is required")
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            src = os.path.join(tmpdirname, "in.m4a")
+            out = os.path.join(tmpdirname, "out.m4a")
+            download_uri_to_file(source_uri, src)
+
+            args = [get_ffmpeg_bin(), "-y"]
+            if start_sec > 0:
+                args += ["-ss", str(start_sec)]
+            if duration_sec > 0:
+                args += ["-t", str(duration_sec)]
+            args += ["-i", src, "-vn", "-acodec", "aac", "-b:a", "192k", out]
+            proc = run_ffmpeg(args)
+            if proc.returncode != 0 or not os.path.exists(out):
+                raise Exception("Audio trim failed")
+
+            dest = output_put_url or output_video_uri
+            if not dest:
+                raise Exception("Provide output_video_uri or output_put_url")
+            upload_file_to_destination(dest, out, content_type="audio/mp4")
+
+            return { 'statusCode': 200, 'body': 'Audio trim successful!' }
     elif task == "PING":
         return {
             'statusCode': 200,
