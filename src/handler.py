@@ -79,7 +79,13 @@ def encode_video(
         cmd = " ".join(parts)
         print("Complete command:")
         print(cmd)
-        return subprocess.run(cmd, shell=True)
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        print(f"Return code: {proc.returncode}")
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        return proc
 
     # Try 1: Full GPU path (NVDEC + CUDA + NVENC)
     vf_filters = []
@@ -135,26 +141,32 @@ def downsample_video(
         cmd_line = " ".join(parts)
         print("Complete command:")
         print(cmd_line)
-        return subprocess.run(cmd_line, shell=True)
+        proc = subprocess.run(cmd_line, shell=True, capture_output=True, text=True)
+        print(f"Return code: {proc.returncode}")
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        return proc
 
     # Try 1: GPU scale + NVENC
-    cmd = [get_ffmpeg_bin(), "-hwaccel", "cuvid", "-hwaccel_output_format", "cuda",
+    cmd = [get_ffmpeg_bin(), "-y", "-hwaccel", "cuvid", "-hwaccel_output_format", "cuda",
            "-i", shlex.quote(input_video), "-vcodec", "h264_nvenc",
-           "-vf", f'scale_cuda="{ratio}"', "-cq", "26", shlex.quote(output_video)]
+           "-vf", f'scale_cuda=\"{ratio}\"', "-cq", "26", "-c:a", "copy", "-movflags", "+faststart", shlex.quote(output_video)]
     result = run_cmd(cmd)
 
     if result.returncode != 0 or not os.path.exists(output_video):
         # Try 2: software scale + NVENC encode
         print("GPU scale failed or output missing; falling back to software scale.")
-        cmd2 = [get_ffmpeg_bin(), "-i", shlex.quote(input_video),
-                "-vf", f'scale={ratio}', "-c:v", "h264_nvenc", "-cq", "26",
+        cmd2 = [get_ffmpeg_bin(), "-y", "-i", shlex.quote(input_video),
+                "-vf", f"scale={ratio}", "-c:v", "h264_nvenc", "-cq", "26", "-c:a", "copy", "-movflags", "+faststart",
                 shlex.quote(output_video)]
         result = run_cmd(cmd2)
         if result.returncode != 0 or not os.path.exists(output_video):
             # Try 3: software scale + libx264
             print("NVENC encode failed; falling back to libx264.")
-            cmd3 = [get_ffmpeg_bin(), "-i", shlex.quote(input_video),
-                    "-vf", f'scale={ratio}', "-c:v", "libx264", "-crf", "23",
+            cmd3 = [get_ffmpeg_bin(), "-y", "-i", shlex.quote(input_video),
+                    "-vf", f'scale={ratio}', "-c:v", "libx264", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart",
                     shlex.quote(output_video)]
             result = run_cmd(cmd3)
 
