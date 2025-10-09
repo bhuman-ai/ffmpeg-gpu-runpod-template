@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 from urllib.parse import urlparse
 import requests
+import mimetypes
 from botocore.config import Config as BotoConfig
 
 HANDLER_VERSION = "2025-10-06-raw-ffmpeg-v2"
@@ -18,6 +19,12 @@ S3_REGION = os.environ.get("S3_REGION", "auto")
 S3_ACCESS_KEY = os.environ.get("HMAC_KEY") or os.environ.get("AWS_ACCESS_KEY_ID")
 S3_SECRET_KEY = os.environ.get("HMAC_SECRET") or os.environ.get("AWS_SECRET_ACCESS_KEY")
 S3_ADDRESSING_STYLE = os.environ.get("S3_ADDRESSING_STYLE", "virtual")  # "virtual" or "path"
+
+# Optional HTTP fallback for public R2 reads when presign/HMAC aren’t available.
+# Example: R2_PUBLIC_BASE_URL=https://videos.example.com/pipelines  (points at bucket root or job namespace)
+# If set, s3://<bucket>/<key> becomes <R2_PUBLIC_BASE_URL>/<key> for GET.
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL")
+R2_PUBLIC_BUCKET = os.environ.get("R2_PUBLIC_BUCKET")  # if provided, only applies to this bucket
 
 s3 = boto3.client(
     "s3",
@@ -48,6 +55,7 @@ def is_http_uri(uri: str) -> bool:
 
 
 def download_uri_to_file(uri: str, filename: str):
+    # Direct HTTP(S)
     if is_http_uri(uri):
         with requests.get(uri, stream=True, timeout=60) as r:
             r.raise_for_status()
@@ -56,9 +64,30 @@ def download_uri_to_file(uri: str, filename: str):
                     if chunk:
                         f.write(chunk)
         return
-    # Assume gs:// or s3://
+
+    # Assume gs:// or s3://  (including R2 S3)
     bucket, key, _ = get_bucket_key(uri)
-    s3.download_file(Bucket=bucket, Key=key, Filename=filename)
+
+    # Prefer S3 API when credentials are present
+    if S3_ACCESS_KEY and S3_SECRET_KEY:
+        s3.download_file(Bucket=bucket, Key=key, Filename=filename)
+        return
+
+    # Fallback: try public HTTP base if configured (useful when presign is unavailable on caller)
+    if R2_PUBLIC_BASE_URL and (not R2_PUBLIC_BUCKET or R2_PUBLIC_BUCKET == bucket):
+        # Construct public URL: <base>/<key>
+        public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key.lstrip('/')}"
+        with requests.get(public_url, stream=True, timeout=60) as r:
+            if r.status_code >= 400:
+                raise Exception(f"PUBLIC_GET_FAILED: HTTP {r.status_code} for {public_url}")
+            with open(filename, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return
+
+    # No way to fetch the source
+    raise Exception("NO_PRESIGN_METHOD_AVAILABLE")
 
 
 def upload_file_to_destination(dest: str, filename: str, content_type: str = "video/mp4"):
@@ -70,7 +99,30 @@ def upload_file_to_destination(dest: str, filename: str, content_type: str = "vi
             raise Exception(f"HTTP PUT upload failed: {resp.status_code} {resp.text[:512]}")
         return
     bucket, key, _ = get_bucket_key(dest)
-    s3.upload_file(Filename=filename, Bucket=bucket, Key=key)
+    extra = {"ContentType": content_type} if content_type else None
+    if extra:
+        s3.upload_file(Filename=filename, Bucket=bucket, Key=key, ExtraArgs=extra)
+    else:
+        s3.upload_file(Filename=filename, Bucket=bucket, Key=key)
+
+
+def guess_content_type(path_or_key: str) -> str:
+    # Common overrides for media
+    lower = path_or_key.lower()
+    if lower.endswith('.mp4'):
+        return 'video/mp4'
+    if lower.endswith('.m4a'):
+        return 'audio/mp4'
+    if lower.endswith('.wav'):
+        return 'audio/wav'
+    if lower.endswith('.mp3'):
+        return 'audio/mpeg'
+    if lower.endswith('.json'):
+        return 'application/json'
+    if lower.endswith('.ass') or lower.endswith('.srt'):
+        return 'text/plain'
+    ctype, _ = mimetypes.guess_type(path_or_key)
+    return ctype or 'application/octet-stream'
 
 
 def get_ffmpeg_bin():
@@ -271,6 +323,68 @@ def concatenate_videos(
             print(proc.stderr)
         return proc
 
+    # Helper: probe width/height
+    def probe_wh(path: str):
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0:s=x",
+                    path,
+                ],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                w, h = proc.stdout.strip().split("x")
+                return max(2, int(w)), max(2, int(h))
+        except Exception:
+            pass
+        return 0, 0
+
+    # Determine a common canvas (target_w x target_h):
+    # - target_h = max even height among inputs
+    # - target_w = max even width AFTER scaling each input to target_h (keeping AR)
+    widths = []
+    heights = []
+    for f in segment_files:
+        w, h = probe_wh(f)
+        widths.append(w)
+        heights.append(h)
+    # Fallback if probing failed: choose 832p portrait-friendly canvas
+    if not any(heights):
+        target_h = 832
+        target_w = 752
+    else:
+        target_h = max(heights) if max(heights) % 2 == 0 else max(heights) - 1
+        if target_h < 2:
+            target_h = 2
+        scaled_ws = []
+        for w, h in zip(widths, heights):
+            if w <= 0 or h <= 0:
+                scaled_ws.append(0)
+            else:
+                sw = int((w * target_h) / float(h) + 0.5)
+                if sw % 2 == 1:
+                    sw -= 1
+                if sw < 2:
+                    sw = 2
+                scaled_ws.append(sw)
+        target_w = max(scaled_ws) if scaled_ws else 752
+        if target_w % 2 == 1:
+            target_w -= 1
+        if target_w < 2:
+            target_w = 2
+
     # Build inputs
     base = [get_ffmpeg_bin(), "-y"]
     for f in segment_files:
@@ -279,8 +393,17 @@ def concatenate_videos(
     # Build filter_complex to normalize streams and concat
     chains = []
     for i in range(n):
-        chains.append(f"[{i}:v]scale=trunc(iw/2)*2:trunc(ih/2)*2,setpts=PTS-STARTPTS[v{i}]")
-        chains.append(f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=async=0:first_pts=0,asetpts=PTS-STARTPTS[a{i}]")
+        # Scale to fit within target_w x target_h, then pad to exact canvas; normalize SAR/FPS and PTS
+        chains.append(
+            (
+                f"[{i}:v]scale=w={target_w}:h={target_h}:force_original_aspect_ratio=decrease,"
+                f"pad=w={target_w}:h={target_h}:x=(ow-iw)/2:y=(oh-ih)/2:color=black,"
+                f"setsar=1,setpts=PTS-STARTPTS[v{i}]"
+            )
+        )
+        chains.append(
+            f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,aresample=async=0:first_pts=0,asetpts=PTS-STARTPTS[a{i}]"
+        )
     concat_inputs = "".join([f"[v{i}][a{i}]" for i in range(n)])
     filter_complex = f"{';'.join(chains)};{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
 
@@ -575,6 +698,21 @@ def handler(job_main):
             upload_file_to_destination(dest, out, content_type="audio/wav")
 
             return { 'statusCode': 200, 'body': 'Audio trim successful!' }
+    elif task == "STAGE_OBJECT":
+        # Copy any source (http/https/s3/gs) into R2/S3 destination under your canonical videos folder
+        source_uri = event.get("source_uri")
+        dest_uri = event.get("dest_uri")
+        content_type = event.get("content_type")  # optional; inferred if missing
+        if not source_uri or not dest_uri:
+            raise Exception("Provide source_uri and dest_uri")
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            local = os.path.join(tmpdirname, "stage.bin")
+            print(f"Staging from {source_uri} -> {dest_uri}")
+            download_uri_to_file(source_uri, local)
+            if not content_type:
+                content_type = guess_content_type(dest_uri)
+            upload_file_to_destination(dest_uri, local, content_type=content_type)
+        return { 'statusCode': 200, 'body': 'Stage successful!' }
     elif task == "PING":
         return {
             'statusCode': 200,
