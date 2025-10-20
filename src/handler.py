@@ -630,6 +630,41 @@ def handler(job_main):
                 'statusCode': 200,
                 'body': 'FFMPEG command executed successfully!'
             }
+    elif task == "FFMPEG_CMD":
+        # Execute a raw ffmpeg argv exactly as provided in parameters.args.
+        # parameters: { args: ["ffmpeg","-i","<url>",...,"/tmp/out.mp4"], output_video_uri?: s3://..., output_put_url?: https://... }
+        params = event
+        args = params.get("args", [])
+        output_video_uri = params.get("output_video_uri")
+        output_put_url = params.get("output_put_url")
+        if not isinstance(args, list) or not args:
+            raise Exception("Provide 'args' array for ffmpeg.")
+
+        # Ensure output directory exists if the final arg is a file path under /tmp
+        try:
+            out_path = None
+            if isinstance(args[-1], str) and args[-1].startswith("/"):
+                out_path = args[-1]
+                out_dir = os.path.dirname(out_path)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        proc = run_ffmpeg([get_ffmpeg_bin()] + [str(a) for a in args if a is not None])
+        if proc.returncode != 0:
+            raise Exception(f"FFMPEG_CMD failed rc={proc.returncode}")
+
+        # Upload result if a destination is provided
+        dest = output_put_url or output_video_uri
+        if dest and out_path and os.path.exists(out_path):
+            # Guess content-type from filename
+            ctype = guess_content_type(out_path)
+            upload_file_to_destination(dest, out_path, content_type=ctype)
+            return { 'statusCode': 200, 'body': 'FFMPEG_CMD executed and uploaded successfully!', 'output': dest }
+
+        # If no destination given, return a simple ok (callers that need a URL should provide output_put_url)
+        return { 'statusCode': 200, 'body': 'FFMPEG_CMD executed successfully!' }
     elif task == "AUDIO_TRIM":
         source_uri = event.get("source_uri")
         start_sec = float(event.get("start_sec", 0))
