@@ -640,6 +640,13 @@ def handler(job_main):
         if not isinstance(args, list) or not args:
             raise Exception("Provide 'args' array for ffmpeg.")
 
+        # If caller included 'ffmpeg' as the first token, drop it to avoid 'ffmpeg ffmpeg ...'
+        try:
+            if isinstance(args[0], str) and args[0].strip().lower() in ("ffmpeg", "/ffmpeg"):
+                args = args[1:]
+        except Exception:
+            pass
+
         # Ensure output directory exists if the final arg is a file path under /tmp
         try:
             out_path = None
